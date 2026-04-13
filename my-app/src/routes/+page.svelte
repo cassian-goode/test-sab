@@ -10,65 +10,137 @@ Hello, Typst!
 This came from the left pane.
 `);
 
-	let svg = $state('');
-	let error = $state('');
-	let ready = $state(false);
-	let compiling = $state(false);
-	let status = $state('Starting...');
-	let initError = $state('');
+	// Change: Keep stable page entries so unchanged pages can be reused.
+	// Each entry stores the original SVG plus an object URL for display.
+	let pageEntries = $state([]);
 
-	let compileToSvg = null;
+	let error = $state('');
+	let status = $state('Starting...');
+	let workerReady = $state(false);
+	let compiling = $state(false);
+
+	let worker = null;
+	let latestRequestId = 0;
+
 	const extensions = [];
 
-	let svgUrl = $derived(svg ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}` : '');
+	function makePageEntry(index, svg) {
+		const blob = new Blob([svg], { type: 'image/svg+xml' });
+		const url = URL.createObjectURL(blob);
 
-	onMount(async () => {
-		status = 'Loading Wasm module...';
+		return { index, svg, url };
+	}
 
-		try {
-			const mod = await import('$lib/typst-bridge/typst_bridge.js');
-			status = 'Initializing Wasm...';
-
-			await mod.default();
-
-			compileToSvg = mod.compile_to_svg_wasm;
-			ready = true;
-			status = 'Wasm ready';
-		} catch (err) {
-			initError = err instanceof Error ? err.message : String(err);
-			status = 'Wasm failed to load';
-			console.error('Wasm init failed:', err);
-		}
-	});
-
-	function compileNow(sourceToCompile) {
-		if (!ready || !compileToSvg) return;
-
-		compiling = true;
-		error = '';
-		status = 'Compiling...';
-
-		try {
-			svg = compileToSvg(sourceToCompile);
-			status = 'Compile succeeded';
-		} catch (err) {
-			svg = '';
-			error = err instanceof Error ? err.message : String(err);
-			status = 'Compile failed';
-			console.error('Compile failed:', err);
-		} finally {
-			compiling = false;
+	function revokePageEntry(entry) {
+		if (entry?.url) {
+			URL.revokeObjectURL(entry.url);
 		}
 	}
 
+	function replacePages(nextSvgs) {
+		const nextEntries = [];
+
+		// Change: Only create new page URLs for pages whose SVG actually changed.
+		// Unchanged pages keep the same object identity and URL.
+		for (let index = 0; index < nextSvgs.length; index += 1) {
+			const nextSvg = nextSvgs[index];
+			const previous = pageEntries[index];
+
+			if (previous && previous.svg === nextSvg) {
+				nextEntries.push(previous);
+			} else {
+				if (previous) {
+					revokePageEntry(previous);
+				}
+
+				nextEntries.push(makePageEntry(index, nextSvg));
+			}
+		}
+
+		// Change: Revoke URLs for pages that disappeared (for example if the
+		// document became shorter).
+		for (let index = nextEntries.length; index < pageEntries.length; index += 1) {
+			revokePageEntry(pageEntries[index]);
+		}
+
+		pageEntries = nextEntries;
+	}
+
+	function clearPages() {
+		for (const entry of pageEntries) {
+			revokePageEntry(entry);
+		}
+
+		pageEntries = [];
+	}
+
+	function requestCompile(sourceToCompile) {
+		if (!worker || !workerReady) return;
+
+		latestRequestId += 1;
+		compiling = true;
+		error = '';
+		status = 'Compiling…';
+
+		worker.postMessage({
+			type: 'compile',
+			requestId: latestRequestId,
+			source: sourceToCompile
+		});
+	}
+
+	onMount(() => {
+		worker = new Worker(new URL('../lib/typst-worker.js', import.meta.url), {
+			type: 'module'
+		});
+
+		worker.onmessage = (event) => {
+			const message = event.data ?? {};
+
+			if (message.type === 'ready') {
+				workerReady = true;
+				status = 'Worker ready';
+				return;
+			}
+
+			if (message.type === 'init-error') {
+				error = message.error;
+				status = 'Worker failed to initialize';
+				return;
+			}
+
+			// Ignore stale compile results so only the newest request updates the preview.
+			if (message.requestId !== latestRequestId) return;
+
+			if (message.type === 'compile-result') {
+				replacePages(message.pages ?? []);
+				compiling = false;
+				error = '';
+				status = `Compile succeeded (${pageEntries.length} page${pageEntries.length === 1 ? '' : 's'})`;
+				return;
+			}
+
+			if (message.type === 'compile-error') {
+				compiling = false;
+				error = message.error;
+				status = 'Compile failed';
+			}
+		};
+
+		return () => {
+			worker?.terminate();
+			clearPages();
+		};
+	});
+
 	$effect(() => {
-		if (!ready || !compileToSvg) return;
+		if (!workerReady) return;
 
 		const pendingSource = source;
 
 		const timeout = setTimeout(() => {
-			compileNow(pendingSource);
-		}, 50);
+			requestCompile(pendingSource);
+		}, 300);
 
 		return () => clearTimeout(timeout);
 	});
@@ -78,10 +150,6 @@ This came from the left pane.
 	<span class="status">{status}</span>
 </div>
 
-{#if initError}
-	<pre class="error">Init error: {initError}</pre>
-{/if}
-
 <div class="layout">
 	<div class="pane editor-pane">
 		<CodeMirror bind:value={source} {extensions} />
@@ -90,10 +158,18 @@ This came from the left pane.
 	<div class="pane preview-pane">
 		{#if error}
 			<pre class="error">{error}</pre>
-		{:else if svgUrl}
-			<img class="preview-image" src={svgUrl} alt="Typst preview" />
+		{:else if pageEntries.length > 0}
+			<div class="page-stack">
+				{#each pageEntries as page (page.index)}
+					<div class="page-shell">
+						<img class="page-image" src={page.url} alt={`Typst page ${page.index + 1}`} />
+					</div>
+				{/each}
+			</div>
+		{:else if compiling}
+			<p class="placeholder">Compiling preview…</p>
 		{:else}
-			<p>No preview yet.</p>
+			<p class="placeholder">No preview yet.</p>
 		{/if}
 	</div>
 </div>
@@ -116,7 +192,6 @@ This came from the left pane.
 	.toolbar {
 		padding: 1rem 1rem 0 1rem;
 		display: flex;
-		gap: 1rem;
 		align-items: center;
 	}
 
@@ -127,7 +202,7 @@ This came from the left pane.
 
 	.layout {
 		display: grid;
-		grid-template-columns: 1fr 1fr;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
 		gap: 1rem;
 		height: calc(100vh - 40px);
 		padding: 1rem;
@@ -146,20 +221,40 @@ This came from the left pane.
 	.preview-pane {
 		border: 1px solid #ddd;
 		border-radius: 8px;
-		background: white;
+		background: #eef0f3;
 		overflow: auto;
-		padding: 1rem;
+		padding: 1.5rem;
 		box-sizing: border-box;
 	}
 
-	.preview-image {
+	.page-stack {
+		display: flex;
+		flex-direction: column;
+		gap: 24px;
+		align-items: center;
+	}
+
+	.page-shell {
+		max-width: 100%;
+	}
+
+	.page-image {
 		display: block;
 		max-width: 100%;
 		height: auto;
+		background: white;
+		box-shadow:
+			0 1px 3px rgba(0, 0, 0, 0.12),
+			0 8px 24px rgba(0, 0, 0, 0.08);
+	}
+
+	.placeholder {
+		margin: 0;
+		color: #666;
 	}
 
 	.error {
-		margin: 0 1rem 1rem 1rem;
+		margin: 0;
 		white-space: pre-wrap;
 		font-family: monospace;
 		color: #b00020;
