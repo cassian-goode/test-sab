@@ -1,62 +1,179 @@
 use std::sync::RwLock;
 
+use comemo::Track;
 use serde::Serialize;
 use typst::diag::{FileError, FileResult, SourceDiagnostic};
+use typst::ecow::EcoString;
 use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
-use typst_layout::PagedDocument;
+use typst_layout::{Page, PagedDocument};
+use typst_library::layout::Point;
+use typst_library::model::LateLinkResolver;
+use typst_utils::hash128;
 use wasm_bindgen::prelude::*;
 
 #[derive(Serialize)]
-struct CompileOutput {
-    pages: Vec<String>,
+struct CompileDocumentOutput {
+    page_count: usize,
+}
+
+#[derive(Serialize)]
+struct ChangedPageOutput {
+    index: usize,
+    svg: String,
+}
+
+#[derive(Serialize)]
+struct RenderChangedPagesOutput {
+    changed_pages: Vec<ChangedPageOutput>,
+    cache_hit_count: usize,
+    cache_miss_count: usize,
+}
+
+#[derive(Clone)]
+struct CachedPage {
+    hash: u128
 }
 
 #[wasm_bindgen]
 pub struct CompilerSession {
     world: SimpleWorld,
+    document: Option<PagedDocument>,
+    page_cache: Vec<Option<CachedPage>>,
 }
 
 #[wasm_bindgen]
 impl CompilerSession {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        // Change: Build the expensive, mostly-static compiler state once.
-        // Fonts, font book, library, and the main file identity all live for the
-        // whole session instead of being rebuilt every compile.
+        // Keep the expensive, mostly-static compiler state alive for the whole session.
         Self {
-            world: SimpleWorld::new(
-                "#set page(width: 300pt, height: 180pt, margin: 16pt)\n",
-            ),
+            world: SimpleWorld::new("#set text(size: 14pt)\n"),
+            document: None,
+            page_cache: Vec::new(),
         }
     }
 
-    pub fn compile(&mut self, source: &str) -> Result<JsValue, JsValue> {
-        // Change: Reuse the same world and only replace the main source text.
+    #[wasm_bindgen]
+    pub fn compile_document(&mut self, source: &str) -> Result<JsValue, JsValue> {
         self.world.set_main_source(source);
 
-        let pages = compile_pages(&self.world).map_err(|err| JsValue::from_str(&err))?;
+        // Compile once and store the final paged document in the session.
+        let document = compile_document_internal(&self.world)
+            .map_err(|err| JsValue::from_str(&err))?;
+        let page_count = document.pages().len();
 
-        serde_wasm_bindgen::to_value(&CompileOutput { pages })
+        self.document = Some(document);
+
+        // Keep the cache aligned to the current page count.
+        self.page_cache.truncate(page_count);
+        if self.page_cache.len() < page_count {
+            self.page_cache.resize_with(page_count, || None);
+        }
+
+        serde_wasm_bindgen::to_value(&CompileDocumentOutput { page_count })
             .map_err(|err| JsValue::from_str(&err.to_string()))
+    }
+
+    #[wasm_bindgen]
+    pub fn render_changed_pages(&mut self) -> Result<JsValue, JsValue> {
+        let page_count = self
+            .document
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("no compiled document"))?
+            .pages()
+            .len();
+
+        if self.page_cache.len() > page_count {
+            self.page_cache.truncate(page_count);
+        } else if self.page_cache.len() < page_count {
+            self.page_cache.resize_with(page_count, || None);
+        }
+
+        let mut changed_pages = Vec::new();
+        let mut cache_hit_count = 0usize;
+        let mut cache_miss_count = 0usize;
+
+        // Change: Hash every page, but only render and return pages whose hash changed.
+        for index in 0..page_count {
+            let (page_hash, maybe_svg) = {
+                let document = self
+                    .document
+                    .as_ref()
+                    .ok_or_else(|| JsValue::from_str("no compiled document"))?;
+
+                let page = document
+                    .pages()
+                    .get(index)
+                    .ok_or_else(|| JsValue::from_str("page index out of range"))?;
+
+                let page_hash = hash128(page);
+
+                let cache_hit = self
+                    .page_cache
+                    .get(index)
+                    .and_then(|entry| entry.as_ref())
+                    .is_some_and(|cached| cached.hash == page_hash);
+
+                if cache_hit {
+                    (page_hash, None)
+                } else {
+                    let svg = render_page_svg_in_bundle(document, page)
+                        .map_err(|err| JsValue::from_str(&err))?;
+                    (page_hash, Some(svg))
+                }
+            };
+
+            match maybe_svg {
+                Some(svg) => {
+                    self.page_cache[index] = Some(CachedPage {
+                        hash: page_hash
+                    });
+
+                    changed_pages.push(ChangedPageOutput { index, svg });
+                    cache_miss_count += 1;
+                }
+                None => {
+                    cache_hit_count += 1;
+                }
+            }
+        }
+
+        serde_wasm_bindgen::to_value(&RenderChangedPagesOutput {
+            changed_pages,
+            cache_hit_count,
+            cache_miss_count,
+        })
+        .map_err(|err| JsValue::from_str(&err.to_string()))
     }
 }
 
-fn compile_pages(world: &SimpleWorld) -> Result<Vec<String>, String> {
+fn compile_document_internal(world: &SimpleWorld) -> Result<PagedDocument, String> {
     let warned = typst::compile::<PagedDocument>(world);
 
     match warned.output {
-        Ok(document) => {
-            // Change: Render each page separately so the UI can display distinct
-            // sheets instead of one giant merged SVG.
-            let pages = document.pages().iter().map(typst_svg::svg).collect::<Vec<_>>();
-            Ok(pages)
-        }
+        Ok(document) => Ok(document),
         Err(errors) => Err(format_diagnostics(&errors)),
     }
+}
+
+fn render_page_svg_in_bundle(document: &PagedDocument, page: &Page) -> Result<String, String> {
+    // We are not emitting extra anchors in this preview experiment.
+    let anchors: Vec<(Point, EcoString)> = Vec::new();
+
+    let resolver = make_bundle_link_resolver(document);
+
+    let svg = typst_svg::svg_in_bundle(page, &anchors, resolver.track());
+
+    Ok(svg)
+}
+
+fn make_bundle_link_resolver(document: &PagedDocument) -> LateLinkResolver<'_> {
+    // Single-document preview mode: resolve links relative to the current document.
+    LateLinkResolver::new(None, document.introspector().as_ref())
 }
 
 fn format_diagnostics(diags: &[SourceDiagnostic]) -> String {
@@ -79,8 +196,6 @@ impl SimpleWorld {
     fn new(initial_source: &str) -> Self {
         let (book, fonts) = load_embedded_fonts();
 
-        // Change: Create one stable main file id up front and keep it forever.
-        // This mirrors the idea of a persistent "main file" inside an editor session.
         let main_id = RootedPath::new(
             VirtualRoot::Project,
             VirtualPath::new("main.typ").unwrap(),
@@ -99,8 +214,6 @@ impl SimpleWorld {
     }
 
     fn set_main_source(&self, new_source: &str) {
-        // Change: Update the existing source in place instead of constructing a
-        // brand new world on every compile.
         let mut source = self.source.write().unwrap();
         source.replace(new_source);
     }
@@ -152,7 +265,6 @@ impl World for SimpleWorld {
     }
 
     fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
-        // Still intentionally ignored for now.
         None
     }
 }
@@ -162,23 +274,20 @@ mod tests {
     use super::*;
 
     const SIMPLE_DOC: &str = r#"
-#set page(width: 200pt, height: 120pt, margin: 12pt)
 #set text(size: 14pt)
 
 Hello, Typst!
 "#;
 
     #[test]
-    fn compiles_simple_doc_to_separate_pages() {
+    fn compiles_document() {
         let world = SimpleWorld::new(SIMPLE_DOC);
-        let pages = compile_pages(&world).expect("expected Typst source to compile to SVG pages");
-
-        assert_eq!(pages.len(), 1);
-        assert!(pages[0].contains("<svg"));
+        let document = compile_document_internal(&world).expect("expected document to compile");
+        assert_eq!(document.pages().len(), 1);
     }
 
     #[test]
-    fn reuses_same_world_for_multiple_compiles() {
+    fn reuses_same_world_identity() {
         let world = SimpleWorld::new("Hello");
         let first_id = world.main();
 
@@ -186,5 +295,19 @@ Hello, Typst!
         let second_id = world.main();
 
         assert_eq!(first_id, second_id);
+    }
+
+    #[test]
+    fn page_hash_changes_when_page_changes() {
+        let world_a = SimpleWorld::new("#set text(size: 14pt)\n\nHello");
+        let doc_a = compile_document_internal(&world_a).expect("doc A should compile");
+
+        let world_b = SimpleWorld::new("#set text(size: 14pt)\n\nHello!");
+        let doc_b = compile_document_internal(&world_b).expect("doc B should compile");
+
+        let hash_a = hash128(&doc_a.pages()[0]);
+        let hash_b = hash128(&doc_b.pages()[0]);
+
+        assert_ne!(hash_a, hash_b);
     }
 }

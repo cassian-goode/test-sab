@@ -1,19 +1,12 @@
 <script>
 	import { onMount } from 'svelte';
 	import CodeMirror from '$lib/CodeMirror.svelte';
+	import initialSourceText from '$lib/sample-typst-source.txt?raw';
 
-	let source = $state(`#set page(width: 300pt, height: 180pt, margin: 16pt)
-#set text(size: 14pt)
+	// Load the initial editor content from a separate text file.
+	let source = $state(initialSourceText);
 
-Hello, Typst!
-
-This came from the left pane.
-`);
-
-	// Change: Keep stable page entries so unchanged pages can be reused.
-	// Each entry stores the original SVG plus an object URL for display.
 	let pageEntries = $state([]);
-
 	let error = $state('');
 	let status = $state('Starting...');
 	let workerReady = $state(false);
@@ -22,7 +15,21 @@ This came from the left pane.
 	let worker = null;
 	let latestRequestId = 0;
 
+	// Timing data for the current run.
+	let metrics = $state({
+		pageCount: 0,
+		compileMs: null,
+		renderPassMs: null,
+		totalTimeToFullPreviewMs: null,
+		cacheHitCount: 0,
+		cacheMissCount: 0
+	});
+
 	const extensions = [];
+
+	function formatMs(value) {
+		return value == null ? '—' : `${value.toFixed(1)} ms`;
+	}
 
 	function makePageEntry(index, svg) {
 		const blob = new Blob([svg], { type: 'image/svg+xml' });
@@ -37,41 +44,45 @@ This came from the left pane.
 		}
 	}
 
-	function replacePages(nextSvgs) {
-		const nextEntries = [];
-
-		// Change: Only create new page URLs for pages whose SVG actually changed.
-		// Unchanged pages keep the same object identity and URL.
-		for (let index = 0; index < nextSvgs.length; index += 1) {
-			const nextSvg = nextSvgs[index];
-			const previous = pageEntries[index];
-
-			if (previous && previous.svg === nextSvg) {
-				nextEntries.push(previous);
-			} else {
-				if (previous) {
-					revokePageEntry(previous);
-				}
-
-				nextEntries.push(makePageEntry(index, nextSvg));
-			}
-		}
-
-		// Change: Revoke URLs for pages that disappeared (for example if the
-		// document became shorter).
-		for (let index = nextEntries.length; index < pageEntries.length; index += 1) {
-			revokePageEntry(pageEntries[index]);
-		}
-
-		pageEntries = nextEntries;
-	}
-
 	function clearPages() {
 		for (const entry of pageEntries) {
 			revokePageEntry(entry);
 		}
 
 		pageEntries = [];
+	}
+
+	function replaceChangedPages(changedPages, pageCount) {
+		const entriesByIndex = new Map(pageEntries.map((entry) => [entry.index, entry]));
+
+		// Change: Only patch the pages that actually came back from the worker.
+		for (const changedPage of changedPages) {
+			const previous = entriesByIndex.get(changedPage.index);
+			if (previous) {
+				revokePageEntry(previous);
+			}
+
+			entriesByIndex.set(changedPage.index, makePageEntry(changedPage.index, changedPage.svg));
+		}
+
+		// Remove any old pages that are now beyond the end of the document.
+		for (const [index, entry] of entriesByIndex) {
+			if (index >= pageCount) {
+				revokePageEntry(entry);
+				entriesByIndex.delete(index);
+			}
+		}
+
+		// Rebuild the ordered page list from the patched map.
+		const nextEntries = [];
+		for (let index = 0; index < pageCount; index += 1) {
+			const entry = entriesByIndex.get(index);
+			if (entry) {
+				nextEntries.push(entry);
+			}
+		}
+
+		pageEntries = nextEntries;
 	}
 
 	function requestCompile(sourceToCompile) {
@@ -81,6 +92,15 @@ This came from the left pane.
 		compiling = true;
 		error = '';
 		status = 'Compiling…';
+
+		metrics = {
+			pageCount: 0,
+			compileMs: null,
+			renderPassMs: null,
+			totalTimeToFullPreviewMs: null,
+			cacheHitCount: 0,
+			cacheMissCount: 0
+		};
 
 		worker.postMessage({
 			type: 'compile',
@@ -109,14 +129,24 @@ This came from the left pane.
 				return;
 			}
 
-			// Ignore stale compile results so only the newest request updates the preview.
+			// Ignore stale results so only the newest request updates the preview.
 			if (message.requestId !== latestRequestId) return;
 
 			if (message.type === 'compile-result') {
-				replacePages(message.pages ?? []);
+				replaceChangedPages(message.changedPages ?? [], message.pageCount ?? 0);
+
+				metrics = {
+					pageCount: message.metrics.pageCount,
+					compileMs: message.metrics.compileMs,
+					renderPassMs: message.metrics.renderPassMs,
+					totalTimeToFullPreviewMs: message.metrics.totalTimeToFullPreviewMs,
+					cacheHitCount: message.metrics.cacheHitCount ?? 0,
+					cacheMissCount: message.metrics.cacheMissCount ?? 0
+				};
+
 				compiling = false;
 				error = '';
-				status = `Compile succeeded (${pageEntries.length} page${pageEntries.length === 1 ? '' : 's'})`;
+				status = `Compile succeeded (${metrics.pageCount} page${metrics.pageCount === 1 ? '' : 's'}, ${metrics.cacheMissCount} changed)`;
 				return;
 			}
 
@@ -140,7 +170,7 @@ This came from the left pane.
 
 		const timeout = setTimeout(() => {
 			requestCompile(pendingSource);
-		}, 300);
+		}, 50);
 
 		return () => clearTimeout(timeout);
 	});
@@ -156,6 +186,15 @@ This came from the left pane.
 	</div>
 
 	<div class="pane preview-pane">
+		<div class="metrics">
+			<div><strong>Page count:</strong> {metrics.pageCount || '—'}</div>
+			<div><strong>Full Typst compile:</strong> {formatMs(metrics.compileMs)}</div>
+			<div><strong>Hash/render pass:</strong> {formatMs(metrics.renderPassMs)}</div>
+			<div><strong>Time to full preview:</strong> {formatMs(metrics.totalTimeToFullPreviewMs)}</div>
+			<div><strong>Cache hits:</strong> {metrics.cacheHitCount}</div>
+			<div><strong>Cache misses:</strong> {metrics.cacheMissCount}</div>
+		</div>
+
 		{#if error}
 			<pre class="error">{error}</pre>
 		{:else if pageEntries.length > 0}
@@ -225,6 +264,18 @@ This came from the left pane.
 		overflow: auto;
 		padding: 1.5rem;
 		box-sizing: border-box;
+	}
+
+	.metrics {
+		display: grid;
+		grid-template-columns: 1fr;
+		gap: 0.35rem;
+		background: white;
+		border: 1px solid #ddd;
+		border-radius: 8px;
+		padding: 0.9rem 1rem;
+		margin-bottom: 1rem;
+		font-size: 0.9rem;
 	}
 
 	.page-stack {

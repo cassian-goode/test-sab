@@ -2020,12 +2020,15 @@ source = "git+https://github.com/typst/typst-assets?rev=57a38ca#57a38ca98236748a
 name = "typst-bridge"
 version = "0.1.0"
 dependencies = [
+ "comemo",
  "serde",
  "serde-wasm-bindgen",
  "typst",
  "typst-assets 0.14.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "typst-layout",
+ "typst-library",
  "typst-svg",
+ "typst-utils",
  "wasm-bindgen",
 ]
 

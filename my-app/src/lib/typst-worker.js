@@ -4,7 +4,7 @@ let session = null;
 let initPromise = null;
 
 async function ensureSession() {
-	// Change: Initialize Wasm and the persistent Rust session once inside the worker.
+	// Initialize Wasm and the persistent Rust session once inside the worker.
 	if (!initPromise) {
 		initPromise = (async () => {
 			await init();
@@ -20,7 +20,6 @@ async function ensureSession() {
 	return initPromise;
 }
 
-// Kick off initialization immediately so the worker is warm as soon as possible.
 ensureSession();
 
 self.onmessage = async (event) => {
@@ -31,16 +30,37 @@ self.onmessage = async (event) => {
 	try {
 		await ensureSession();
 
-		// Change: Compile inside the worker, not on the main thread.
-		const result = session.compile(message.source);
+		const requestStart = performance.now();
+
+		// Measure the full Typst compile.
+		const compileStart = performance.now();
+		const compileInfo = session.compile_document(message.source);
+		const compileMs = performance.now() - compileStart;
+
+		// Measure the whole hash+render pass that now returns only changed pages.
+		const renderStart = performance.now();
+		const changed = session.render_changed_pages();
+		const renderPassMs = performance.now() - renderStart;
+
+		const totalTimeToFullPreviewMs = performance.now() - requestStart;
 
 		self.postMessage({
 			type: 'compile-result',
 			requestId: message.requestId,
-			pages: result.pages
+			pageCount: compileInfo.page_count ?? 0,
+			changedPages: changed.changed_pages ?? [],
+			metrics: {
+				pageCount: compileInfo.page_count ?? 0,
+				compileMs,
+				renderPassMs,
+				totalTimeToFullPreviewMs,
+				cacheHitCount: changed.cache_hit_count ?? 0,
+				cacheMissCount: changed.cache_miss_count ?? 0
+			}
 		});
 	} catch (error) {
 		const messageText = error instanceof Error ? error.message : String(error);
+		console.error('Worker compile failed:', error);
 
 		self.postMessage({
 			type: 'compile-error',
