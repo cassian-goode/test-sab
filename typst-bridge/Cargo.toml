@@ -1,0 +1,13 @@
+[package]
+name = "typst-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+typst = { path = "../typst/crates/typst" }
+typst-svg = { path = "../typst/crates/typst-svg" }
+typst-assets = { version = "0.14.2", features = ["fonts"] }
+wasm-bindgen = "0.2"
