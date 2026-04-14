@@ -21,8 +21,8 @@ async function ensureSession(threadCount) {
 		const threadedPkg = await import('./typst-bridge/typst_bridge.js');
 
 		await threadedPkg.default();
+		threadedPkg.init_panic_hook?.();
 
-		// Helpful debug signal while we are validating the threaded runtime.
 		console.log(
 			'threaded wasm memory buffer is SAB:',
 			threadedPkg.__wasm.memory.buffer instanceof SharedArrayBuffer
@@ -72,6 +72,20 @@ self.onmessage = async (event) => {
 		const renderStart = performance.now();
 		const changed = session.render_changed_pages();
 		const renderPassMs = performance.now() - renderStart;
+
+		console.log(
+			'changed pages:',
+			changed.changed_pages?.length ?? 0,
+			'first svg length:',
+			changed.changed_pages?.[0]?.svg?.length ?? 0,
+			'first svg prefix:',
+			changed.changed_pages?.[0]?.svg?.slice(0, 200) ?? null
+    );
+		
+		const firstSvg = changed.changed_pages?.[0]?.svg ?? '';
+    console.log('first svg length:', firstSvg.length);
+    console.log('first svg prefix:', firstSvg.slice(0, 300));
+    console.log('first svg suffix:', firstSvg.slice(-300));
 
 		const totalTimeToFullPreviewMs = performance.now() - requestStart;
 

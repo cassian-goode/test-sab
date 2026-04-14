@@ -19,6 +19,12 @@ use rayon::prelude::*;
 
 pub use wasm_bindgen_rayon::init_thread_pool;
 
+#[wasm_bindgen]
+pub fn init_panic_hook() {
+    console_error_panic_hook::set_once();
+}
+
+
 #[derive(Serialize)]
 struct CompileDocumentOutput {
     page_count: usize,
@@ -59,6 +65,8 @@ pub struct CompilerSession {
 impl CompilerSession {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
+        console_error_panic_hook::set_once();
+        
         Self {
             world: SimpleWorld::new("#set text(size: 14pt)\n"),
             document: None,
@@ -190,16 +198,14 @@ fn compute_page_render_decisions(
     decisions.into_iter().collect()
 }
 
-fn render_page_svg_in_bundle(document: &PagedDocument, page: &Page) -> Result<String, String> {
-    let anchors: Vec<(Point, EcoString)> = Vec::new();
-    let resolver = make_bundle_link_resolver(document);
-
-    Ok(typst_svg::svg_in_bundle(page, &anchors, resolver.track()))
+fn render_page_svg_in_bundle(_document: &PagedDocument, page: &Page) -> Result<String, String> {
+    let svg = typst_svg::svg(page);
+    Ok(format!("<!-- FROM typst_svg::svg len={} -->{}", svg.len(), svg))
 }
 
-fn make_bundle_link_resolver(document: &PagedDocument) -> LateLinkResolver<'_> {
-    LateLinkResolver::new(None, document.introspector().as_ref())
-}
+// fn make_bundle_link_resolver(document: &PagedDocument) -> LateLinkResolver<'_> {
+//     LateLinkResolver::new(None, document.introspector().as_ref())
+// }
 
 fn format_diagnostics(diags: &[SourceDiagnostic]) -> String {
     diags

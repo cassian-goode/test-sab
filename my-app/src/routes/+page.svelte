@@ -211,6 +211,9 @@
 			<div class="page-stack">
 				{#each pageEntries as page (page.index)}
 					<div class="page-shell">
+						<!-- <div class="page-image">
+							{@html page.svg}
+						</div> -->
 						<img class="page-image" src={page.url} alt={`Typst page ${page.index + 1}`} />
 					</div>
 				{/each}
@@ -302,11 +305,16 @@
 	.page-image {
 		display: block;
 		max-width: 100%;
-		height: auto;
 		background: white;
 		box-shadow:
 			0 1px 3px rgba(0, 0, 0, 0.12),
 			0 8px 24px rgba(0, 0, 0, 0.08);
+	}
+
+	.page-image :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
 	}
 
 	.placeholder {
