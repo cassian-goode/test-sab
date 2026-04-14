@@ -15,6 +15,10 @@ use typst_library::model::LateLinkResolver;
 use typst_utils::hash128;
 use wasm_bindgen::prelude::*;
 
+use rayon::prelude::*;
+
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 #[derive(Serialize)]
 struct CompileDocumentOutput {
     page_count: usize,
@@ -35,7 +39,13 @@ struct RenderChangedPagesOutput {
 
 #[derive(Clone)]
 struct CachedPage {
-    hash: u128
+    hash: u128,
+}
+
+struct PageRenderDecision {
+    index: usize,
+    hash: u128,
+    svg: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -49,7 +59,6 @@ pub struct CompilerSession {
 impl CompilerSession {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        // Keep the expensive, mostly-static compiler state alive for the whole session.
         Self {
             world: SimpleWorld::new("#set text(size: 14pt)\n"),
             document: None,
@@ -61,14 +70,13 @@ impl CompilerSession {
     pub fn compile_document(&mut self, source: &str) -> Result<JsValue, JsValue> {
         self.world.set_main_source(source);
 
-        // Compile once and store the final paged document in the session.
-        let document = compile_document_internal(&self.world)
-            .map_err(|err| JsValue::from_str(&err))?;
+        // Compile the full Typst document once and keep it in the session.
+        let document =
+            compile_document_internal(&self.world).map_err(|err| JsValue::from_str(&err))?;
         let page_count = document.pages().len();
 
         self.document = Some(document);
 
-        // Keep the cache aligned to the current page count.
         self.page_cache.truncate(page_count);
         if self.page_cache.len() < page_count {
             self.page_cache.resize_with(page_count, || None);
@@ -80,12 +88,12 @@ impl CompilerSession {
 
     #[wasm_bindgen]
     pub fn render_changed_pages(&mut self) -> Result<JsValue, JsValue> {
-        let page_count = self
+        let document = self
             .document
             .as_ref()
-            .ok_or_else(|| JsValue::from_str("no compiled document"))?
-            .pages()
-            .len();
+            .ok_or_else(|| JsValue::from_str("no compiled document"))?;
+
+        let page_count = document.pages().len();
 
         if self.page_cache.len() > page_count {
             self.page_cache.truncate(page_count);
@@ -93,47 +101,32 @@ impl CompilerSession {
             self.page_cache.resize_with(page_count, || None);
         }
 
+        let previous_hashes: Vec<Option<u128>> = self
+            .page_cache
+            .iter()
+            .map(|entry| entry.as_ref().map(|cached| cached.hash))
+            .collect();
+
+        // Use Rayon to hash pages and render changed pages in parallel.
+        let mut decisions =
+            compute_page_render_decisions(document, &previous_hashes)
+                .map_err(|err| JsValue::from_str(&err))?;
+
+        decisions.sort_by_key(|decision| decision.index);
+
         let mut changed_pages = Vec::new();
         let mut cache_hit_count = 0usize;
         let mut cache_miss_count = 0usize;
 
-        // Change: Hash every page, but only render and return pages whose hash changed.
-        for index in 0..page_count {
-            let (page_hash, maybe_svg) = {
-                let document = self
-                    .document
-                    .as_ref()
-                    .ok_or_else(|| JsValue::from_str("no compiled document"))?;
-
-                let page = document
-                    .pages()
-                    .get(index)
-                    .ok_or_else(|| JsValue::from_str("page index out of range"))?;
-
-                let page_hash = hash128(page);
-
-                let cache_hit = self
-                    .page_cache
-                    .get(index)
-                    .and_then(|entry| entry.as_ref())
-                    .is_some_and(|cached| cached.hash == page_hash);
-
-                if cache_hit {
-                    (page_hash, None)
-                } else {
-                    let svg = render_page_svg_in_bundle(document, page)
-                        .map_err(|err| JsValue::from_str(&err))?;
-                    (page_hash, Some(svg))
-                }
-            };
-
-            match maybe_svg {
+        for decision in decisions {
+            match decision.svg {
                 Some(svg) => {
-                    self.page_cache[index] = Some(CachedPage {
-                        hash: page_hash
-                    });
+                    self.page_cache[decision.index] = Some(CachedPage { hash: decision.hash });
 
-                    changed_pages.push(ChangedPageOutput { index, svg });
+                    changed_pages.push(ChangedPageOutput {
+                        index: decision.index,
+                        svg,
+                    });
                     cache_miss_count += 1;
                 }
                 None => {
@@ -160,19 +153,51 @@ fn compile_document_internal(world: &SimpleWorld) -> Result<PagedDocument, Strin
     }
 }
 
-fn render_page_svg_in_bundle(document: &PagedDocument, page: &Page) -> Result<String, String> {
-    // We are not emitting extra anchors in this preview experiment.
-    let anchors: Vec<(Point, EcoString)> = Vec::new();
+fn compute_page_render_decisions(
+    document: &PagedDocument,
+    previous_hashes: &[Option<u128>],
+) -> Result<Vec<PageRenderDecision>, String> {
+    let page_count = document.pages().len();
 
+    let decisions = (0..page_count)
+        .into_par_iter()
+        .map(|index| {
+            let page = &document.pages()[index];
+            let page_hash = hash128(page);
+
+            let cache_hit = previous_hashes
+                .get(index)
+                .and_then(|hash| *hash)
+                .is_some_and(|old_hash| old_hash == page_hash);
+
+            if cache_hit {
+                Ok(PageRenderDecision {
+                    index,
+                    hash: page_hash,
+                    svg: None,
+                })
+            } else {
+                let svg = render_page_svg_in_bundle(document, page)?;
+                Ok(PageRenderDecision {
+                    index,
+                    hash: page_hash,
+                    svg: Some(svg),
+                })
+            }
+        })
+        .collect::<Vec<Result<PageRenderDecision, String>>>();
+
+    decisions.into_iter().collect()
+}
+
+fn render_page_svg_in_bundle(document: &PagedDocument, page: &Page) -> Result<String, String> {
+    let anchors: Vec<(Point, EcoString)> = Vec::new();
     let resolver = make_bundle_link_resolver(document);
 
-    let svg = typst_svg::svg_in_bundle(page, &anchors, resolver.track());
-
-    Ok(svg)
+    Ok(typst_svg::svg_in_bundle(page, &anchors, resolver.track()))
 }
 
 fn make_bundle_link_resolver(document: &PagedDocument) -> LateLinkResolver<'_> {
-    // Single-document preview mode: resolve links relative to the current document.
     LateLinkResolver::new(None, document.introspector().as_ref())
 }
 
@@ -196,6 +221,7 @@ impl SimpleWorld {
     fn new(initial_source: &str) -> Self {
         let (book, fonts) = load_embedded_fonts();
 
+        // Keep a stable file id for the session so Typst can reuse work better.
         let main_id = RootedPath::new(
             VirtualRoot::Project,
             VirtualPath::new("main.typ").unwrap(),

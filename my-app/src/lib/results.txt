@@ -1,0 +1,19 @@
+Generated 150 paragraphs, 13169 words, 89207 bytes of Lorem Ipsum
+
+Initial
+
+Page count: 86
+Full Typst compile: 4288.5 ms
+Hash/render pass: 6652.5 ms
+Time to full preview: 10941.0 ms
+Cache hits: 0
+Cache misses: 86
+
+Change at begin:
+
+Page count: 86
+Full Typst compile: 118.9 ms
+Hash/render pass: 243.7 ms
+Time to full preview: 362.6 ms
+Cache hits: 85
+Cache misses: 1

@@ -3,7 +3,6 @@
 	import CodeMirror from '$lib/CodeMirror.svelte';
 	import initialSourceText from '$lib/sample-typst-source.txt?raw';
 
-	// Load the initial editor content from a separate text file.
 	let source = $state(initialSourceText);
 
 	let pageEntries = $state([]);
@@ -15,14 +14,14 @@
 	let worker = null;
 	let latestRequestId = 0;
 
-	// Timing data for the current run.
 	let metrics = $state({
 		pageCount: 0,
 		compileMs: null,
 		renderPassMs: null,
 		totalTimeToFullPreviewMs: null,
 		cacheHitCount: 0,
-		cacheMissCount: 0
+		cacheMissCount: 0,
+		threadCount: null
 	});
 
 	const extensions = [];
@@ -55,7 +54,6 @@
 	function replaceChangedPages(changedPages, pageCount) {
 		const entriesByIndex = new Map(pageEntries.map((entry) => [entry.index, entry]));
 
-		// Change: Only patch the pages that actually came back from the worker.
 		for (const changedPage of changedPages) {
 			const previous = entriesByIndex.get(changedPage.index);
 			if (previous) {
@@ -65,7 +63,6 @@
 			entriesByIndex.set(changedPage.index, makePageEntry(changedPage.index, changedPage.svg));
 		}
 
-		// Remove any old pages that are now beyond the end of the document.
 		for (const [index, entry] of entriesByIndex) {
 			if (index >= pageCount) {
 				revokePageEntry(entry);
@@ -73,7 +70,6 @@
 			}
 		}
 
-		// Rebuild the ordered page list from the patched map.
 		const nextEntries = [];
 		for (let index = 0; index < pageCount; index += 1) {
 			const entry = entriesByIndex.get(index);
@@ -99,7 +95,8 @@
 			renderPassMs: null,
 			totalTimeToFullPreviewMs: null,
 			cacheHitCount: 0,
-			cacheMissCount: 0
+			cacheMissCount: 0,
+			threadCount: metrics.threadCount
 		};
 
 		worker.postMessage({
@@ -119,7 +116,12 @@
 
 			if (message.type === 'ready') {
 				workerReady = true;
-				status = 'Worker ready';
+				metrics = {
+					...metrics,
+					threadCount: message.threadCount ?? null
+				};
+
+				status = `Worker ready (${message.threadCount ?? 1} wasm threads)`;
 				return;
 			}
 
@@ -129,7 +131,6 @@
 				return;
 			}
 
-			// Ignore stale results so only the newest request updates the preview.
 			if (message.requestId !== latestRequestId) return;
 
 			if (message.type === 'compile-result') {
@@ -141,12 +142,13 @@
 					renderPassMs: message.metrics.renderPassMs,
 					totalTimeToFullPreviewMs: message.metrics.totalTimeToFullPreviewMs,
 					cacheHitCount: message.metrics.cacheHitCount ?? 0,
-					cacheMissCount: message.metrics.cacheMissCount ?? 0
+					cacheMissCount: message.metrics.cacheMissCount ?? 0,
+					threadCount: message.metrics.threadCount ?? metrics.threadCount
 				};
 
 				compiling = false;
 				error = '';
-				status = `Compile succeeded (${metrics.pageCount} page${metrics.pageCount === 1 ? '' : 's'}, ${metrics.cacheMissCount} changed)`;
+				status = `Compile succeeded (${message.metrics.pageCount} page${message.metrics.pageCount === 1 ? '' : 's'}, ${message.metrics.cacheMissCount} changed)`;
 				return;
 			}
 
@@ -156,6 +158,13 @@
 				status = 'Compile failed';
 			}
 		};
+
+		const threadCount = Math.max(1, (navigator.hardwareConcurrency ?? 4) - 1);
+
+		worker.postMessage({
+			type: 'init',
+			threadCount
+		});
 
 		return () => {
 			worker?.terminate();
@@ -170,7 +179,7 @@
 
 		const timeout = setTimeout(() => {
 			requestCompile(pendingSource);
-		}, 50);
+		}, 300);
 
 		return () => clearTimeout(timeout);
 	});
@@ -188,6 +197,7 @@
 	<div class="pane preview-pane">
 		<div class="metrics">
 			<div><strong>Page count:</strong> {metrics.pageCount || '—'}</div>
+			<div><strong>Wasm threads:</strong> {metrics.threadCount ?? '—'}</div>
 			<div><strong>Full Typst compile:</strong> {formatMs(metrics.compileMs)}</div>
 			<div><strong>Hash/render pass:</strong> {formatMs(metrics.renderPassMs)}</div>
 			<div><strong>Time to full preview:</strong> {formatMs(metrics.totalTimeToFullPreviewMs)}</div>

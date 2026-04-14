@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/Users/cassiangoode/Dev/Active/sveltekit-codemirror-two/my-app/my-app/spa-server/target/debug/build/mime_guess-12811faccf056304/out/mime_types_generated.rs

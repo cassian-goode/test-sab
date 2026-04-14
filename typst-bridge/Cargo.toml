@@ -7,13 +7,15 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+comemo = "0.5.1"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
 typst = { path = "../typst/crates/typst" }
 typst-layout = { path = "../typst/crates/typst-layout" }
 typst-library = { path = "../typst/crates/typst-library" }
 typst-svg = { path = "../typst/crates/typst-svg" }
 typst-utils = { path = "../typst/crates/typst-utils" }
-typst-assets = { version = "0.14.2", features = ["fonts"] }
+typst-assets = "0.14"
 wasm-bindgen = "0.2"
-serde = { version = "1", features = ["derive"] }
-serde-wasm-bindgen = "0.6"
-comemo = "0.5"
+rayon = "1"
+wasm-bindgen-rayon = "1.3"
